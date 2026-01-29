@@ -3,136 +3,156 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 
-const PORT = process.env.PORT || 7153;
-const YANDEX_BASE_URL = 'https://fleet-api.taxi.yandex.net';
-
-const PARK_ID = process.env.YANDEX_PARK_ID ? process.env.YANDEX_PARK_ID.trim().replace(/;/g, '') : "";
-const CLIENT_ID = process.env.YANDEX_CLIENT_ID ? process.env.YANDEX_CLIENT_ID.trim().replace(/;/g, '') : "";
-const API_KEY = process.env.YANDEX_API_KEY ? process.env.YANDEX_API_KEY.trim().replace(/;/g, '') : "";
-const COMMISSION_PERCENT = 2;
-
 const app = express();
 app.use(bodyParser.json());
 
-const headers = { 'X-Client-ID': CLIENT_ID, 'X-API-Key': API_KEY };
+// --- SOZLAMALAR ---
+const PORT = process.env.PORT || 7153;
+const YANDEX_BASE_URL = 'https://fleet-api.taxi.yandex.net';
 
-// =================================================================
-// HAYDOVCHINI QIDIRISH (POZIVNOY / CALLSIGN BO'YICHA)
-// =================================================================
-async function findDriverById(searchVal) {
-    const searchText = String(searchVal).trim();
-    console.log(`🔍 QIDIRUV (Pozivnoy): "${searchText}"`);
+// .env dan ma'lumotlarni olish
+const PARK_ID = process.env.YANDEX_PARK_ID;
+const CLIENT_ID = process.env.YANDEX_CLIENT_ID;
+const API_KEY = process.env.YANDEX_API_KEY;
+
+// MUHIM: Bu yerga boya konsolda chiqqan Kategoriya ID sini qo'ying
+const YANDEX_CATEGORY_ID = "70000000000000000000000000000001"; 
+
+const headers = { 
+    'X-Client-ID': CLIENT_ID, 
+    'X-API-Key': API_KEY,
+    'Accept-Language': 'eng'
+};
+
+// =============================================================
+// 1. AQLLI QIDIRUV (Pozivnoy yoki Tel oxirgi 5 tasi)
+// =============================================================
+async function findDriverSmart(searchText) {
+    const queryID = String(searchText).trim();
+    console.log(`\n🔍 Qidirilmoqda: [${queryID}]`);
 
     try {
-        // 1. ANIQ SO'ROV: "callsign" filtrini ishlatamiz.
-        // fields ni yozmaymiz (400 xatodan qochish uchun).
         const response = await axios.post(`${YANDEX_BASE_URL}/v1/parks/driver-profiles/list`, {
             query: {
-                park: { 
-                    id: PARK_ID,
-                    driver_profile: { callsign: searchText } // <--- ENG MUHIM JOYI SHU!
-                }
+                park: { id: PARK_ID, driver_profile: { work_status: ['working'] } }
             },
-            limit: 1
+            limit: 500 
         }, { headers });
 
         const drivers = response.data.driver_profiles;
 
-        // 2. TEKSHIRUV
-        if (drivers && drivers.length > 0) {
-            const d = drivers[0];
+        if (!drivers || drivers.length === 0) return null;
+
+        const found = drivers.find(d => {
+            const p = d.driver_profile;
+            const callsign = p.callsign ? String(p.callsign).trim() : "";
+            if (callsign === queryID) return true;
+
+            const phone = (p.phones && p.phones[0]) ? p.phones[0].replace(/\D/g, '') : "";
+            if (phone.endsWith(queryID)) return true;
+
+            return false;
+        });
+
+        if (found) {
+            const p = found.driver_profile;
+            const person = found.person || {};
+
+            // Ismni yig'ish
+            let name = "Ismsiz haydovchi";
+            if (person.full_name) {
+                name = person.full_name;
+            } else if (p.last_name || p.first_name) {
+                name = `${p.last_name || ""} ${p.first_name || ""}`.trim();
+            }
+
+            const balance = found.account ? Number(found.account.balance) : 0;
+            console.log(`✅ TOPILDI: ${name} | Balans: ${balance} so'm`);
             
-            // Yandex rostan ham shu pozivnoyli odamni berdimi?
-            // Ba'zan kesh tufayli eski ma'lumot qolishi mumkin, shuning uchun tekshiramiz.
-            if (d.driver_profile.callsign !== searchText) {
-                console.log(`⚠️ XAVFLI: So'ralgan pozivnoy "${searchText}", lekin keldi "${d.driver_profile.callsign}"`);
-                return null;
-            }
-
-            // Ismni yig'amiz
-            let fullName = "Ismi Yo'q";
-            if (d.person) {
-                if (d.person.full_name) fullName = d.person.full_name;
-                else if (d.person.first_name) fullName = `${d.person.last_name || ''} ${d.person.first_name}`.trim();
-            }
-
-            console.log(`✅ TOPILDI (Pozivnoy): ${fullName}`);
-            console.log(`   ID: ${d.driver_profile.id}`);
-
-            return {
-                driver_profile: { id: d.driver_profile.id },
-                person: { full_name: fullName },
-                account: { balance: (d.account && d.account.balance) ? Number(d.account.balance) : 0 }
-            };
-        } 
-        
-        console.log("❌ Bu Pozivnoy bo'yicha hech kim topilmadi.");
+            return { id: p.id, name, balance };
+        }
         return null;
-
     } catch (error) {
-        console.error("XATO:", error.message);
-        if (error.response) console.error(JSON.stringify(error.response.data, null, 2));
+        console.error("🔴 API Xatosi:", error.message);
         return null;
     }
 }
 
-// =================================================================
-// 2. KATEGORIYA
-// =================================================================
-async function getTransactionCategoryId() {
-    try {
-        const res = await axios.post(`${YANDEX_BASE_URL}/v2/parks/transaction-categories/list`, {
-            query: { park: { id: PARK_ID } }
-        }, { headers });
-        const target = res.data.transaction_categories.find(c => c.is_enabled && c.is_income); 
-        return target ? target.id : null;
-    } catch (e) { return null; }
-}
-
-const authenticate = (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    const creds = Buffer.from(`${process.env.PAYNET_USER}:${process.env.PAYNET_PASSWORD}`).toString('base64');
-    if (!authHeader || authHeader !== `Basic ${creds}`) return res.status(401).json({ error: "Unauthorized" });
-    next();
-};
-
-// =================================================================
-// 3. API YO'LLARI
-// =================================================================
-app.post('/paynet/rpc', authenticate, async (req, res) => {
+// =============================================================
+// 2. PAYNET RPC METODLARI
+// =============================================================
+app.post('/paynet/rpc', async (req, res) => {
     const { method, params, id } = req.body;
-    
-    if (params && params.fields) {
-        console.log(`📥 Paynet: ${params.fields.account} (${method})`);
+
+    // --- A) GetInformation (Haydovchini tekshirish) ---
+    if (method === 'GetInformation') {
+        const driver = await findDriverSmart(params.fields.account);
+        
+        if (!driver) {
+            return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Haydovchi topilmadi" } });
+        }
+
+        return res.json({
+            jsonrpc: "2.0", id,
+            result: {
+                status: "0",
+                timestamp: new Date().toISOString(),
+                fields: { name: driver.name, balance: driver.balance }
+            }
+        });
     }
 
-    try {
-        if (method === 'GetInformation') {
-            const driver = await findDriverById(params.fields.account);
-            if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Client not found" } });
-            return res.json({ jsonrpc: "2.0", id, result: { status: "0", timestamp: new Date().toISOString(), fields: { name: driver.person.full_name, balance: driver.account.balance } } });
-        } 
-        else if (method === 'PerformTransaction') {
-            const driver = await findDriverById(params.fields.account);
-            if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Client not found" } });
+    // --- B) PerformTransaction (Pul o'tkazish) ---
+    if (method === 'PerformTransaction') {
+        const driver = await findDriverSmart(params.fields.account);
+        if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Haydovchi topilmadi" } });
 
-            const amount = Number(params.amount) / 100;
-            const finalAmount = amount - (amount * (COMMISSION_PERCENT / 100));
-            const categoryId = await getTransactionCategoryId();
-            if (!categoryId) return res.json({ jsonrpc: "2.0", id, error: { code: 102, message: "Transaction Category Not Found" } });
+        try {
+            const totalAmount = Number(params.amount) / 100; // Tiyindan so'mga
+            const paynetFee = totalAmount * 0.045;           // 4.5% Paynet xizmat haqi
+            const netAmount = totalAmount - paynetFee;       // Haydovchiga boradigan sof summa
 
+            console.log(`\n💸 To'lov: ${totalAmount} so'm`);
+            console.log(`🧾 Paynet 4.5%: -${paynetFee} so'm`);
+            console.log(`🚀 Yandexga: ${netAmount} so'm`);
+
+            // Yandex balansini to'ldirish
             await axios.post(`${YANDEX_BASE_URL}/v2/parks/transactions`, {
-                park_id: PARK_ID, contractor_profile_id: driver.driver_profile.id, category_id: categoryId, 
-                amount: String(finalAmount), currency_code: 'UZS', description: `Paynet ID: ${params.transactionId}`
+                park_id: PARK_ID,
+                contractor_profile_id: driver.id,
+                category_id: YANDEX_CATEGORY_ID,
+                amount: String(netAmount),
+                currency_code: "UZS",
+                description: `Paynet ID: ${params.transactionId} (4.5% fee deducted)`
             }, { headers });
 
-            return res.json({ jsonrpc: "2.0", id, result: { providerTrnId: Date.now(), timestamp: new Date().toISOString(), fields: { client_id: params.fields.account } }});
+            return res.json({
+                jsonrpc: "2.0", id,
+                result: {
+                    providerTrnId: String(Date.now()),
+                    timestamp: new Date().toISOString(),
+                    fields: { client_id: params.fields.account }
+                }
+            });
+        } catch (e) {
+            console.error("🔴 To'lovda xato:", e.response ? e.response.data : e.message);
+            return res.json({ jsonrpc: "2.0", id, error: { code: 102, message: "Yandex qabul qilmadi" } });
         }
-        else if (method === 'CheckTransaction') return res.json({ jsonrpc: "2.0", id, result: { transactionState: 1, timestamp: new Date().toISOString(), providerTrnId: Date.now() }});
-        
-        res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+    }
 
-    } catch (error) { console.error("XATO:", error.message); res.json({ jsonrpc: "2.0", id, error: { code: 102, message: "System Error" } }); }
+    // --- C) CheckTransaction (Holatni tekshirish) ---
+    if (method === 'CheckTransaction') {
+        return res.json({
+            jsonrpc: "2.0", id,
+            result: {
+                transactionState: 1,
+                timestamp: new Date().toISOString(),
+                providerTrnId: String(Date.now())
+            }
+        });
+    }
+
+    res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
 });
 
-app.listen(PORT, () => console.log(`🚀 Server ishga tushdi: Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Park Pegas Serveri: http://localhost:${PORT}/paynet/rpc`));
