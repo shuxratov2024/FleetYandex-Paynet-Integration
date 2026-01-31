@@ -1,130 +1,109 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const bodyParser = require('body-parser');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
-// --- SOZLAMALAR ---
 const PORT = process.env.PORT || 7153;
 const YANDEX_BASE_URL = 'https://fleet-api.taxi.yandex.net';
 
-// .env dan ma'lumotlarni olish
-const PARK_ID = process.env.YANDEX_PARK_ID;
-const CLIENT_ID = process.env.YANDEX_CLIENT_ID;
-const API_KEY = process.env.YANDEX_API_KEY;
+const { YANDEX_PARK_ID, YANDEX_CLIENT_ID, YANDEX_API_KEY } = process.env;
 
-// MUHIM: Bu yerga boya konsolda chiqqan Kategoriya ID sini qo'ying
+// ⚠️ BU YERGA O'ZINGIZNING KATEGORIYA ID-INGIZNI QO'YING
 const YANDEX_CATEGORY_ID = "70000000000000000000000000000001"; 
 
 const headers = { 
-    'X-Client-ID': CLIENT_ID, 
-    'X-API-Key': API_KEY,
-    'Accept-Language': 'eng'
+    'X-Client-ID': YANDEX_CLIENT_ID, 
+    'X-API-Key': YANDEX_API_KEY,
+    'Accept-Language': 'ru'
 };
 
 // =============================================================
-// 1. AQLLI QIDIRUV (Pozivnoy yoki Tel oxirgi 5 tasi)
+// 🔍 AQLLI QIDIRUV (POZIVNOY YOKI TEL OXIRGI 5 TASI)
 // =============================================================
-async function findDriverSmart(searchText) {
-    const queryID = String(searchText).trim();
-    console.log(`\n🔍 Qidirilmoqda: [${queryID}]`);
+async function findDriver(queryID) {
+    const search = String(queryID).trim();
+    console.log(`\n🔍 Paynet qidiruvi: [${search}]`);
 
     try {
-        const response = await axios.post(`${YANDEX_BASE_URL}/v1/parks/driver-profiles/list`, {
-            query: {
-                park: { id: PARK_ID, driver_profile: { work_status: ['working'] } }
-            },
-            limit: 500 
+        const res = await axios.post(`${YANDEX_BASE_URL}/v1/parks/driver-profiles/list`, {
+            query: { park: { id: YANDEX_PARK_ID, driver_profile: { work_status: ['working'] } } },
+            limit: 500
         }, { headers });
 
-        const drivers = response.data.driver_profiles;
+        const drivers = res.data.driver_profiles;
 
-        if (!drivers || drivers.length === 0) return null;
-
+        // Qidirish logikasi
         const found = drivers.find(d => {
             const p = d.driver_profile;
-            const callsign = p.callsign ? String(p.callsign).trim() : "";
-            if (callsign === queryID) return true;
-
             const phone = (p.phones && p.phones[0]) ? p.phones[0].replace(/\D/g, '') : "";
-            if (phone.endsWith(queryID)) return true;
-
-            return false;
+            return (p.callsign === search || phone.endsWith(search));
         });
 
         if (found) {
             const p = found.driver_profile;
             const person = found.person || {};
-
-            // Ismni yig'ish
-            let name = "Ismsiz haydovchi";
-            if (person.full_name) {
-                name = person.full_name;
-            } else if (p.last_name || p.first_name) {
-                name = `${p.last_name || ""} ${p.first_name || ""}`.trim();
-            }
-
-            const balance = found.account ? Number(found.account.balance) : 0;
-            console.log(`✅ TOPILDI: ${name} | Balans: ${balance} so'm`);
             
-            return { id: p.id, name, balance };
+            // F.I.SH yig'ish
+            let fullName = person.full_name || `${p.last_name || ""} ${p.first_name || ""}`.trim();
+            if (!fullName) fullName = "Haydovchi";
+
+            console.log(`✅ TOPILDI: ${fullName}`);
+            return { id: p.id, name: fullName };
         }
+
+        console.log("❌ TOPILMADI.");
         return null;
-    } catch (error) {
-        console.error("🔴 API Xatosi:", error.message);
+
+    } catch (e) {
+        console.error("🔴 API Xatosi:", e.message);
         return null;
     }
 }
 
 // =============================================================
-// 2. PAYNET RPC METODLARI
+// 🛰 PAYNET RPC INTERFEYSI
 // =============================================================
 app.post('/paynet/rpc', async (req, res) => {
     const { method, params, id } = req.body;
 
-    // --- A) GetInformation (Haydovchini tekshirish) ---
+    // --- 1. GetInformation (Faqat ism chiqadi) ---
     if (method === 'GetInformation') {
-        const driver = await findDriverSmart(params.fields.account);
-        
-        if (!driver) {
-            return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Haydovchi topilmadi" } });
-        }
+        const driver = await findDriver(params.fields.account);
+        if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Mijoz topilmadi" } });
 
         return res.json({
             jsonrpc: "2.0", id,
             result: {
                 status: "0",
                 timestamp: new Date().toISOString(),
-                fields: { name: driver.name, balance: driver.balance }
+                fields: {
+                    name: driver.name  // Faqat ism yuboramiz
+                }
             }
         });
     }
 
-    // --- B) PerformTransaction (Pul o'tkazish) ---
+    // --- 2. PerformTransaction (Pulni tushirish) ---
     if (method === 'PerformTransaction') {
-        const driver = await findDriverSmart(params.fields.account);
-        if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Haydovchi topilmadi" } });
+        const driver = await findDriver(params.fields.account);
+        if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Mijoz topilmadi" } });
 
         try {
-            const totalAmount = Number(params.amount) / 100; // Tiyindan so'mga
-            const paynetFee = totalAmount * 0.045;           // 4.5% Paynet xizmat haqi
-            const netAmount = totalAmount - paynetFee;       // Haydovchiga boradigan sof summa
+            const total = Number(params.amount) / 100;
+            const netAmount = total - (total * 0.045); // 4.5% komissiya ayirish
 
-            console.log(`\n💸 To'lov: ${totalAmount} so'm`);
-            console.log(`🧾 Paynet 4.5%: -${paynetFee} so'm`);
-            console.log(`🚀 Yandexga: ${netAmount} so'm`);
-
-            // Yandex balansini to'ldirish
             await axios.post(`${YANDEX_BASE_URL}/v2/parks/transactions`, {
-                park_id: PARK_ID,
+                park_id: YANDEX_PARK_ID,
                 contractor_profile_id: driver.id,
                 category_id: YANDEX_CATEGORY_ID,
                 amount: String(netAmount),
                 currency_code: "UZS",
-                description: `Paynet ID: ${params.transactionId} (4.5% fee deducted)`
+                description: `Paynet ID: ${params.transactionId}`
             }, { headers });
+
+            console.log(`💰 To'ldirildi: +${netAmount} UZS (${driver.name})`);
 
             return res.json({
                 jsonrpc: "2.0", id,
@@ -134,13 +113,13 @@ app.post('/paynet/rpc', async (req, res) => {
                     fields: { client_id: params.fields.account }
                 }
             });
-        } catch (e) {
-            console.error("🔴 To'lovda xato:", e.response ? e.response.data : e.message);
-            return res.json({ jsonrpc: "2.0", id, error: { code: 102, message: "Yandex qabul qilmadi" } });
+        } catch (err) {
+            console.error("❌ Xato:", err.response?.data || err.message);
+            return res.json({ jsonrpc: "2.0", id, error: { code: 102, message: "Yandex xatosi" } });
         }
     }
 
-    // --- C) CheckTransaction (Holatni tekshirish) ---
+    // --- 3. CheckTransaction ---
     if (method === 'CheckTransaction') {
         return res.json({
             jsonrpc: "2.0", id,
@@ -155,4 +134,4 @@ app.post('/paynet/rpc', async (req, res) => {
     res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
 });
 
-app.listen(PORT, () => console.log(`🚀 Park Pegas Serveri: http://localhost:${PORT}/paynet/rpc`));
+app.listen(PORT, () => console.log(`🚀 Server http://localhost:${PORT}/paynet/rpc manzilda ishlamoqda.`));
