@@ -1,0 +1,7 @@
+node_modules/
+.env
+.DS_Store
+transactions_log.json
+drivers_mapping.json
+known_drivers.json
+*.log

@@ -1,0 +1,107 @@
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const fs = require('fs');
+
+const app = express();
+app.use(express.json());
+
+const { YANDEX_PARK_ID, YANDEX_CLIENT_ID, YANDEX_API_KEY, PAYNET_LOGIN, PAYNET_PASSWORD, PORT } = process.env;
+const MAPPING_FILE = './drivers_mapping.json';
+const TRANSACTIONS_FILE = './transactions_log.json';
+
+const CATEGORY_ID = "partner_service_manual_4"; 
+
+let virtualDatabase = new Map();
+let processedTransactions = new Map();
+
+if (fs.existsSync(TRANSACTIONS_FILE)) {
+    try {
+        const data = JSON.parse(fs.readFileSync(TRANSACTIONS_FILE, 'utf8'));
+        processedTransactions = new Map(Object.entries(data));
+    } catch (e) {}
+}
+
+const authorize = (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: "Auth required" });
+    const auth = Buffer.from(authHeader.split(' ')[1], 'base64').toString().split(':');
+    if (auth[0] === PAYNET_LOGIN && auth[1] === PAYNET_PASSWORD) {
+        next();
+    } else {
+        res.status(401).json({ error: "Invalid credentials" });
+    }
+};
+
+async function syncDrivers() {
+    try {
+        let savedMapping = fs.existsSync(MAPPING_FILE) ? JSON.parse(fs.readFileSync(MAPPING_FILE, 'utf8')) : {};
+        const res = await axios.post(`https://fleet-api.taxi.yandex.net/v1/parks/driver-profiles/list`, {
+            query: { park: { id: YANDEX_PARK_ID, driver_profile: { work_status: ['working'] } } },
+            limit: 1000
+        }, { headers: { 'X-Client-ID': YANDEX_CLIENT_ID, 'X-API-Key': YANDEX_API_KEY } });
+
+        let usedIDs = Object.values(savedMapping).map(v => parseInt(v.virtualId));
+        let nextID = usedIDs.length > 0 ? Math.max(...usedIDs) + 1 : 1000;
+
+        res.data.driver_profiles.forEach(d => {
+            const yandexId = d.driver_profile.id;
+            if (!savedMapping[yandexId]) {
+                savedMapping[yandexId] = { virtualId: nextID.toString(), name: `${d.driver_profile.last_name} ${d.driver_profile.first_name}` };                nextID++;
+            }
+            virtualDatabase.set(savedMapping[yandexId].virtualId, { yandexId, name: savedMapping[yandexId].name });
+        });
+        fs.writeFileSync(MAPPING_FILE, JSON.stringify(savedMapping, null, 2));
+    } catch (e) {}
+}
+setInterval(syncDrivers, 30 * 60 * 1000);
+syncDrivers();
+
+app.post('/paynet/rpc', authorize, async (req, res) => {
+    const { method, params, id } = req.body;
+    const account = String(params.fields?.account || "").trim();
+
+    if (method === 'GetInformation') {
+        const driver = virtualDatabase.get(account);
+        if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Mijoz topilmadi" } });
+        return res.json({ jsonrpc: "2.0", id, result: { status: 0, timestamp: new Date().toISOString(), fields: { name: driver.name } } });
+    }
+
+    if (method === 'PerformTransaction') {
+        const transactionId = String(params.transactionId);
+        if (processedTransactions.has(transactionId)) return res.json({ jsonrpc: "2.0", id, error: { code: 201, message: "Tranzaksiya mavjud" } });
+
+        const amountInSum = Number(params.amount) / 100;
+        if (amountInSum <= 0) return res.json({ jsonrpc: "2.0", id, error: { code: 413, message: "Summa xato" } });
+
+        const driver = virtualDatabase.get(account);
+        if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Mijoz topilmadi" } });
+
+        try {
+            await axios.post(`https://fleet-api.taxi.yandex.net/v2/parks/transactions`, {
+                park_id: YANDEX_PARK_ID,
+                contractor_profile_id: driver.yandexId,
+                category_id: CATEGORY_ID,
+                amount: String(amountInSum.toFixed(2)),
+                currency_code: "UZS",
+                description: `Paynet ID: ${transactionId}`
+            }, { headers: { 'X-Client-ID': YANDEX_CLIENT_ID, 'X-API-Key': YANDEX_API_KEY } });
+
+            processedTransactions.set(transactionId, { status: 1, time: new Date() });
+            fs.writeFileSync(TRANSACTIONS_FILE, JSON.stringify(Object.fromEntries(processedTransactions)));
+
+            return res.json({ jsonrpc: "2.0", id, result: { providerTrnId: String(Date.now()), timestamp: new Date().toISOString(), fields: { client_id: account } } });
+        } catch (err) {
+            return res.json({ jsonrpc: "2.0", id, error: { code: 102, message: "Tizim xatosi" } });
+        }
+    }
+
+    if (method === 'CheckTransaction') {
+        const trn = processedTransactions.has(String(params.transactionId));
+        return res.json({ jsonrpc: "2.0", id, result: { transactionState: trn ? 1 : 2, timestamp: new Date().toISOString(), providerTrnId: String(Date.now()) } });
+    }
+
+    res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+});
+
+app.listen(PORT || 7153, () => console.log(`🚀 PARKPEGAS Server ${PORT || 7153}-portda ishga tushdi!`));
