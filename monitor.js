@@ -1,113 +1,83 @@
-require('dotenv').config();
+require('dotenv').config(); // Eng tepada turishi shart!
+const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
-const https = require('https');
-const TelegramBot = require('node-telegram-bot-api');
 
 // --- SOZLAMALAR ---
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID = process.env.ADMIN_CHAT_ID; // Bu yerda muammo bo'lgan
 const YANDEX_PARK_ID = process.env.YANDEX_PARK_ID;
 const YANDEX_CLIENT_ID = process.env.YANDEX_CLIENT_ID;
 const YANDEX_API_KEY = process.env.YANDEX_API_KEY;
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 
-// Har 1 daqiqada (60000 ms) tekshiradi
-const CHECK_INTERVAL = 60000; 
-const URL_DRIVERS = "https://fleet-api.taxi.yandex.net/v1/parks/driver-profiles/list";
+const CHECK_INTERVAL = 60000; // 1 daqiqa (429 xatosini oldini oladi)
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+// --- TEKSHIRUV ---
+if (!TOKEN) { console.error("❌ XATO: TELEGRAM_BOT_TOKEN topilmadi!"); process.exit(1); }
+if (!CHAT_ID) { console.error("❌ XATO: ADMIN_CHAT_ID topilmadi! .env faylini tekshiring."); process.exit(1); }
 
-// Haydovchilar bazasi fayli
-const DB_FILE = './known_drivers.json';
+const bot = new TelegramBot(TOKEN, { polling: true });
 let knownDrivers = new Set();
 
-// 1. Dastur yonganda eski bazani yuklash
-function loadDb() {
-    if (fs.existsSync(DB_FILE)) {
-        try {
-            const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-            data.forEach(id => knownDrivers.add(id));
-            console.log(`Bazada ${knownDrivers.size} ta haydovchi mavjud.`);
-        } catch (e) {
-            console.error("Bazani o'qishda xato:", e.message);
-        }
-    }
+// Bazani yuklash
+if (fs.existsSync('./known_drivers.json')) {
+    const data = JSON.parse(fs.readFileSync('./known_drivers.json', 'utf8'));
+    knownDrivers = new Set(data);
 }
-loadDb();
 
-// 2. Asosiy tekshiruv funksiyasi
-async function checkNewDrivers() {
+console.log("✅ Monitor Bot ishga tushdi...");
+bot.sendMessage(CHAT_ID, "🚀 Monitoring tizimi qayta ishga tushdi! Har 60 soniyada tekshiradi.").catch(err => console.log("Telegram xatosi:", err.message));
+
+async function checkDrivers() {
     try {
-        // Yandexdan barcha haydovchilarni olamiz
-        const res = await axios.post(URL_DRIVERS, {
-            query: { 
-                park: { id: YANDEX_PARK_ID }, 
-                driver_profile: { work_status: ['working', 'not_working'] } 
+        const response = await axios.post('https://fleet-api.taxi.yandex.net/v1/parks/driver-profiles/list', {
+            query: {
+                park: { id: YANDEX_PARK_ID },
+                driver_profile: { work_status: ['working', 'fired', 'not_working'] } // Hamma statuslarni tekshiramiz
             },
-            limit: 3000, 
-            fields: {
-                driver_profile: ["id", "first_name", "last_name", "phones", "created_date"]
+            limit: 1000,
+            fields: { driver_profile: ['id', 'first_name', 'last_name', 'phones'] }
+        }, {
+            headers: {
+                'X-Client-ID': YANDEX_CLIENT_ID,
+                'X-API-Key': YANDEX_API_KEY,
             }
-        }, { 
-            headers: { 'X-Client-ID': YANDEX_CLIENT_ID, 'X-API-Key': YANDEX_API_KEY },
-            httpsAgent: httpsAgent
         });
 
-        const drivers = res.data.driver_profiles;
+        const drivers = response.data.driver_profiles;
         let newDriversCount = 0;
 
-        // Agar bu birinchi ishga tushish bo'lsa va baza bo'sh bo'lsa
-        // Hammani "eski" deb belgilaymiz, xabar yubormaymiz (spam bo'lmasligi uchun)
-        if (knownDrivers.size === 0 && drivers.length > 0) {
-            drivers.forEach(d => knownDrivers.add(d.driver_profile.id));
-            fs.writeFileSync(DB_FILE, JSON.stringify([...knownDrivers]));
-            console.log(`Boshlang'ich baza yaratildi: ${drivers.length} ta haydovchi.`);
-            bot.sendMessage(ADMIN_CHAT_ID, "🚀 Monitoring tizimi ishga tushdi! Hozircha yangi haydovchilar kuzatilmoqda.");
-            return;
-        }
+        drivers.forEach(driver => {
+            const driverId = driver.driver_profile.id;
 
-        // Har bir haydovchini tekshiramiz
-        for (const d of drivers) {
-            const driverId = d.driver_profile.id;
-            
-            // Agar bu ID bizning bazada yo'q bo'lsa -> DEMAK YANGI!
             if (!knownDrivers.has(driverId)) {
+                // YANGI HAYDOVCHI TOPILDI!
                 newDriversCount++;
-                knownDrivers.add(driverId); // Bazaga qo'shamiz
-                
-                // Telegramga chiroyli xabar
-                const name = `${d.driver_profile.last_name || ""} ${d.driver_profile.first_name || ""}`.trim();
-                const phone = d.driver_profile.phones?.[0] || "Raqam yo'q";
-                
-                const message = `
-🔔 <b>YANGI HAYDOVCHI QO'SHILDI!</b>
+                const name = `${driver.driver_profile.last_name || ''} ${driver.driver_profile.first_name || ''}`;
+                const phone = driver.driver_profile.phones?.[0] || "No'malum";
 
-👤 <b>Ism:</b> ${name}
-📞 <b>Tel:</b> ${phone}
-🆔 <b>ID:</b> <code>${driverId}</code>
+                const message = `🔔 <b>YANGI HAYDOVCHI!</b>\n\n👤 <b>Ism:</b> ${name}\n📞 <b>Tel:</b> ${phone}\n🆔 <code>${driverId}</code>`;
 
-<i>Iltimos, haydovchi bilan bog'laning!</i>`;
+                bot.sendMessage(CHAT_ID, message, { parse_mode: 'HTML' })
+                   .catch(err => console.error("Xabar yuborishda xato:", err.message));
 
-                await bot.sendMessage(ADMIN_CHAT_ID, message, { parse_mode: "HTML" });
-                console.log(`Yangi haydovchi: ${name} (${phone})`);
+                knownDrivers.add(driverId);
             }
-        }
+        });
 
-        // Agar yangilar bo'lsa, bazani yangilab saqlaymiz
         if (newDriversCount > 0) {
-            fs.writeFileSync(DB_FILE, JSON.stringify([...knownDrivers]));
+            fs.writeFileSync('./known_drivers.json', JSON.stringify([...knownDrivers]));
         }
 
-    } catch (e) {
-        console.error("Tekshirishda xato:", e.message);
+    } catch (error) {
+        if (error.response && error.response.status === 429) {
+            console.log("⚠️ Juda ko'p so'rov (429). 1 daqiqa dam olamiz...");
+        } else {
+            console.error("❌ Tekshirishda xato:", error.message);
+        }
     }
 }
 
-// Har 1 daqiqada ishga tushadi
-setInterval(checkNewDrivers, CHECK_INTERVAL);
-
-// Dastur yonishi bilan darrov bir marta tekshirsin
-checkNewDrivers();
-
-console.log("Monitor Bot ishlayapti...");
+// Dastur yonishi bilan bir marta, keyin har daqiqada tekshiradi
+checkDrivers();
+setInterval(checkDrivers, CHECK_INTERVAL);
