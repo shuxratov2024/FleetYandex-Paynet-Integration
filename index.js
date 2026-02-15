@@ -7,7 +7,7 @@ const https = require('https');
 const app = express();
 app.use(express.json());
 
-// ENV ma'lumotlari
+// --- SOZLAMALAR ---
 const YANDEX_PARK_ID = (process.env.YANDEX_PARK_ID || "").trim();
 const YANDEX_CLIENT_ID = (process.env.YANDEX_CLIENT_ID || "").trim();
 const YANDEX_API_KEY = (process.env.YANDEX_API_KEY || "").trim();
@@ -15,19 +15,21 @@ const PAYNET_LOGIN = (process.env.PAYNET_LOGIN || "").trim();
 const PAYNET_PASSWORD = (process.env.PAYNET_PASSWORD || "").trim();
 const PORT = process.env.PORT || 7153;
 
-// --- SOZLAMALAR ---
 const COMMISSION_PERCENT = 4.5; 
-// DIQQAT: Rasmingizdagi URLda ko'ringan ID aynan shu (image_3ac50d.png)
+
+// DIQQAT: O'sha "paynet topup" kategoriyangiz ID si
 const CATEGORY_ID = "partner_service_manual_4"; 
-const URL_TRANSACTION = "https://fleet-api.taxi.yandex.net/v3/parks/driver-profiles/transactions";
+
+// URL MANZILLARI
+const URL_TRANSACTION = "https://fleet-api.taxi.yandex.net/v2/parks/driver-profiles/transactions";
 const URL_DRIVERS = "https://fleet-api.taxi.yandex.net/v1/parks/driver-profiles/list";
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
+// --- BAZA ---
 let virtualDatabase = new Map();
 let processedTransactions = new Map();
 
-// Ma'lumotlarni yuklash
 function loadData() {
     if (fs.existsSync('./drivers_mapping.json')) {
         try {
@@ -44,7 +46,7 @@ function loadData() {
 }
 loadData();
 
-// Auth Middleware
+// --- AUTH ---
 const authorize = (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: "Auth required" });
@@ -53,7 +55,7 @@ const authorize = (req, res, next) => {
     else res.status(401).json({ error: "Invalid credentials" });
 };
 
-// Driver Sync
+// --- SYNC ---
 async function syncDrivers() {
     try {
         const res = await axios.post(URL_DRIVERS, {
@@ -77,47 +79,44 @@ async function syncDrivers() {
 syncDrivers();
 setInterval(syncDrivers, 600000);
 
-// API PAYNET
+// --- API ---
 app.post('/paynet/rpc', authorize, async (req, res) => {
     const { method, params, id } = req.body;
     const transactionId = String(params.transactionId || params.transactionID || "");
     const account = String(params.fields?.account || params.fields?.client_id || "").trim();
 
-    // 1. GetInformation
     if (method === 'GetInformation') {
         const driver = virtualDatabase.get(account);
         if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Клиент не найден" } });
         return res.json({ jsonrpc: "2.0", id, result: { status: 0, timestamp: new Date().toISOString(), fields: { name: driver.name } } });
     }
 
-    // 2. PerformTransaction
     if (method === 'PerformTransaction') {
-        // DUPLICATE CHECK
         if (processedTransactions.has(transactionId)) {
-            return res.json({
-                jsonrpc: "2.0",
-                id,
-                error: { code: 201, message: "Tранзакция уже существует" }
-            });
+            return res.json({ jsonrpc: "2.0", id, error: { code: 201, message: "Tранзакция уже существует" } });
         }
 
         const driver = virtualDatabase.get(account);
         if (!driver) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Клиент не найден" } });
 
-        // KOMISSIYA 4.5% (Yashirin - Yandexda 0.00 bo'ladi)
         const rawAmount = Number(params.amount) / 100;
         const amountToDriver = (rawAmount * (1 - COMMISSION_PERCENT / 100)).toFixed(2);
 
         try {
             await axios.post(URL_TRANSACTION, {
                 park_id: YANDEX_PARK_ID,
-                contractor_profile_id: driver.yandexId,
+                
+                // --- TUZATILDI: contractor_profile_id EMAS, driver_profile_id ---
+                driver_profile_id: driver.yandexId, 
+                
                 amount: amountToDriver,
                 currency_code: "UZS",
+                description: "Пополнение баланса",
+                category_id: CATEGORY_ID,
                 data: {
-                    kind: "topup", 
-                    category_id: CATEGORY_ID, // Paneldagi ID
-                    description: "PAYNET",    // "Sharh" ustunida PAYNET chiqadi
+                    kind: "partner_service_manual", 
+                    category_id: CATEGORY_ID, 
+                    description: "Пополнение баланса",
                     event_at: new Date().toISOString(),
                     fee_amount: "0.00"
                 }
@@ -132,24 +131,22 @@ app.post('/paynet/rpc', authorize, async (req, res) => {
 
             const providerTrnId = String(Date.now());
             const timestamp = new Date().toISOString();
-
             processedTransactions.set(transactionId, { status: 1, time: timestamp, providerTrnId, amount: rawAmount, account });
             fs.writeFileSync('./transactions_log.json', JSON.stringify(Object.fromEntries(processedTransactions)));
 
             return res.json({ jsonrpc: "2.0", id, result: { providerTrnId, timestamp, fields: { client_id: account } } });
         } catch (err) {
+            console.error("Yandex Xatosi:", err.response?.data || err.message);
             return res.json({ jsonrpc: "2.0", id, error: { code: 102, message: "System error" } });
         }
     }
 
-    // 3. CheckTransaction
     if (method === 'CheckTransaction') {
         const trn = processedTransactions.get(transactionId);
         if (!trn) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Транзакция не найдена" } });
         return res.json({ jsonrpc: "2.0", id, result: { transactionState: trn.status, timestamp: trn.time, providerTrnId: trn.providerTrnId } });
     }
 
-    // 4. CancelTransaction
     if (method === 'CancelTransaction') {
         const trn = processedTransactions.get(transactionId);
         if (!trn) return res.json({ jsonrpc: "2.0", id, error: { code: 302, message: "Транзакция не найдена" } });
@@ -164,4 +161,4 @@ app.post('/paynet/rpc', authorize, async (req, res) => {
     res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
 });
 
-app.listen(PORT, () => console.log(`Paynet Server ishladi. Port: ${PORT}`));
+app.listen(PORT, () => console.log(`Paynet Server started on port ${PORT}`));
